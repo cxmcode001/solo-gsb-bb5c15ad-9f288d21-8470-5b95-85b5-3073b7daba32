@@ -675,7 +675,12 @@ def _commit_chunk(
 ) -> dict:
     """落盘临时分片并在单个 IMMEDIATE 事务中二次校验 + 登记（成功即消费认领）。"""
     tmp_path = Path(tmp_file)
+    final = storage.part_path(session_id, start, end)
     with session_locks.get(session_id):
+        # placed 区分两类失败：replace 成功之前失败绝不触碰 parts 目录里
+        # 可能已存在的同路径文件（含历史遗留的未登记分片）；replace 成功
+        # 之后失败才需要把本次刚落位的目标文件删掉。
+        placed = False
         try:
             with db.immediate() as tx:
                 row = tx.execute(
@@ -707,10 +712,11 @@ def _commit_chunk(
                     tx, session_id, start, end, presented_claim
                 )
 
-                # 事务内移动文件：若后续 SQL 失败，事务回滚且下面的 except 会删除文件。
-                final = storage.part_path(session_id, start, end)
+                # 事务内移动文件：若后续 SQL 或事务提交失败，事务回滚，
+                # except 会在会话锁内删掉刚落位的目标文件。
                 final.parent.mkdir(parents=True, exist_ok=True)
                 tmp_path.replace(final)
+                placed = True
 
                 now = storage.utcnow()
                 now_iso = storage.iso(now)
@@ -738,6 +744,13 @@ def _commit_chunk(
                         (consume_claim_id,),
                     )
         except BaseException:
+            # 清理仍在会话锁内，与并发的同区间提交/完成/放弃串行，避免
+            # 误删别人刚落位的文件。移动前失败只删临时文件，parts 目录中
+            # 已有的同路径分片原封不动；移动后失败（登记、事件或提交失败）
+            # 才删除本次刚落位的目标文件。事务已回滚：chunks、chunk_events、
+            # bytes_received 与认领令牌全部保持原状，同区间重传可正常登记。
+            if placed:
+                final.unlink(missing_ok=True)
             tmp_path.unlink(missing_ok=True)
             raise
 
@@ -1352,6 +1365,9 @@ def _copy_chunk(
         # 单事务二次校验 + 落盘 + 登记：与 _commit_chunk 同一原子性保证。
         # 失败清理必须仍在双锁内完成：否则刚 replace 落地、事务却回滚的
         # part 文件可能与并发 PUT 同路径竞争，误删别人刚登记的分片。
+        # placed 保证移动前失败绝不触碰已存在的同路径分片，移动后失败才
+        # 删除本次刚落位的目标文件。
+        placed = False
         try:
             with db.immediate() as tx:
                 trow = tx.execute(
@@ -1409,6 +1425,7 @@ def _copy_chunk(
                 # 事务内移动文件：后续任一 SQL 失败都会回滚并由 except 删除文件。
                 final.parent.mkdir(parents=True, exist_ok=True)
                 tmp_path.replace(final)
+                placed = True
 
                 now = storage.utcnow()
                 now_iso = storage.iso(now)
@@ -1433,10 +1450,12 @@ def _copy_chunk(
                     (length, now_iso, expires_iso, target_session_id),
                 )
         except BaseException:
-            # 仍持有两把会话锁：临时文件与可能已 replace 但未登记的落地
-            # 文件一并删除，绝不留下已登记/半登记的损坏分片。
+            # 仍持有两把会话锁：临时文件必删；仅当本次已把文件 replace
+            # 落位时才删除落地文件，绝不留下已登记/半登记的损坏分片，也
+            # 不误删移动前就已存在的同路径分片。
             tmp_path.unlink(missing_ok=True)
-            final.unlink(missing_ok=True)
+            if placed:
+                final.unlink(missing_ok=True)
             raise
 
         return _chunk_accepted_payload(target_session_id, target_start, target_end)
