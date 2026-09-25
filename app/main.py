@@ -675,7 +675,12 @@ def _commit_chunk(
 ) -> dict:
     """落盘临时分片并在单个 IMMEDIATE 事务中二次校验 + 登记（成功即消费认领）。"""
     tmp_path = Path(tmp_file)
+    final = storage.part_path(session_id, start, end)
     with session_locks.get(session_id):
+        # 只在确认“本次”把文件 replace 落位后才允许删除 final：移动之前的
+        # 失败（会话失效、重叠 409、认领 403/410 等）绝不触碰 parts 目录里
+        # 可能已存在的文件，避免误删别人的分片。
+        placed = False
         try:
             with db.immediate() as tx:
                 row = tx.execute(
@@ -707,10 +712,12 @@ def _commit_chunk(
                     tx, session_id, start, end, presented_claim
                 )
 
-                # 事务内移动文件：若后续 SQL 失败，事务回滚且下面的 except 会删除文件。
-                final = storage.part_path(session_id, start, end)
+                # 事务内移动文件：一旦 replace 成功，后续 SQL 或事务提交若
+                # 失败，必须由下面的 except 删除本次落位的 final，否则磁盘
+                # 留下无登记的孤儿分片。
                 final.parent.mkdir(parents=True, exist_ok=True)
                 tmp_path.replace(final)
+                placed = True
 
                 now = storage.utcnow()
                 now_iso = storage.iso(now)
@@ -738,7 +745,14 @@ def _commit_chunk(
                         (consume_claim_id,),
                     )
         except BaseException:
+            # 清理必须仍在会话锁内完成：刚 replace 落地、事务却回滚（chunks
+            # 登记、chunk_events 写入或提交失败）的 part 文件若留到锁外删除，
+            # 可能与并发 PUT 同路径竞争而误删别人刚登记的分片。只有本次确实
+            # 落位（placed）才删 final——移动前失败时 final 绝不是本次文件，
+            # 一律保留；tmp 在落位后已不存在，missing_ok 兼容落位前失败。
             tmp_path.unlink(missing_ok=True)
+            if placed:
+                final.unlink(missing_ok=True)
             raise
 
     return _chunk_accepted_payload(session_id, start, end)
